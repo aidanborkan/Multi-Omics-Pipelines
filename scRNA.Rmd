@@ -1,0 +1,371 @@
+---
+title: "scRNA"
+author: "aidan borkan"
+date: "2026-02-21"
+output: html_document
+---
+
+```{r libraries, message=FALSE, warning=FALSE}
+# installation
+#install.packages("Matrix")
+#BiocManager::install("GEOquery")
+# ensure over 1.1.7
+#install.packages("rlang", type = "binary")
+#packageVersion("rlang")
+reticulate::py_install("umap-learn", pip = TRUE)
+
+# Comprehensive list
+library(GEOquery)
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(Matrix)
+# Annotations
+library(SingleR)
+library(celldex)
+library(SingleCellExperiment)
+
+gse <- getGEO("GSE75140", GSEMatrix = TRUE)
+expr <- exprs(gse[[1]])
+```
+
+```{r inspect , message=TRUE, warning=FALSE}
+# gse is your GEO object (from getGEO)
+eset <- gse[[1]]
+
+#expr <- exprs(eset)      # expression matrix
+pheno <- pData(eset)     # sample metadata
+fdata <- fData(eset)     # feature metadata (genes)
+dim(expr)     # genes x samples (or probes x samples)
+dim(pheno)
+head(colnames(pheno))
+```
+# often on GEO we need the supplementary data for expr
+```{r suppl, message=TRUE, warning=FALSE}
+df <- read.table(
+  "C:/Users/suzan/Downloads/GSE75140_hOrg.fetal.master.data.frame.txt.gz",
+  header = TRUE,
+  sep = "\t",
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+stopifnot("cell_id" %in% colnames(df))
+
+# Put cell IDs in rownames and drop column
+rownames(df) <- df$cell_id
+df$cell_id <- NULL
+
+# DROP non-expression metadata columns (we discovered 'species' is one)
+if ("species" %in% colnames(df)) df$species <- NULL
+
+# Convert remaining columns to numeric
+df[] <- lapply(df, function(x) suppressWarnings(as.numeric(x)))
+
+# Hard check: no NAs introduced now
+stopifnot(sum(is.na(as.matrix(df))) == 0)
+
+# Confirm numeric range
+range(as.matrix(df), na.rm = TRUE)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+# check rownames, I want to ensure this dataset is scRNA
+# indicator would be either a barcode or cell_id
+head(rownames(df))
+head(colnames(df))
+summary(as.vector(as.matrix(df[,1:100])))
+```
+
+```{r message=FALSE, warning=FALSE}
+# Set cell IDs as rownames
+rownames(df) <- df$cell_id
+
+# Remove cell_id column
+df$cell_id <- NULL
+
+# Convert to numeric matrix
+df <- as.data.frame(lapply(df, as.numeric))
+
+# Confirm
+str(df[1:5,1:5])
+range(as.matrix(df), na.rm=TRUE)
+```
+
+#Step 1: read in 10x data using cellranger, in this case it's pre-processed GEO matrix
+#Create an object
+# transpose and create w/o re-normalizing or scaling
+# store w/o zero values in memory to free RAM
+```{r message=FALSE, warning=FALSE}
+mat <- t(as.matrix(df))  # genes × cells
+
+# Build object with dummy counts + data layer
+zero_counts <- matrix(0, nrow=nrow(mat), ncol=ncol(mat), dimnames=dimnames(mat))
+obj <- CreateSeuratObject(counts = zero_counts, project = "GSE75140")
+obj <- SetAssayData(obj, assay="RNA", layer="data", new.data=mat)
+
+# HVGs by variance (robust)
+gene_var <- apply(mat, 1, var)
+VariableFeatures(obj) <- names(sort(gene_var, decreasing = TRUE))[1:2000]
+
+```
+
+# inspect distribution to find percentiles that can guide cutoffs
+```{r message=FALSE, warning=FALSE}
+
+# Add mitochondrial % to metadata
+# 1) percent.mt (optional)
+# Only makes sense if gene names include MT- genes; fine to compute, but interpret cautiously
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+
+# 2) Set HVGs WITHOUT loess
+data_mat <- GetAssayData(obj, assay = "RNA", layer = "data")  # use data layer for your log-expression
+gene_var <- apply(as.matrix(data_mat), 1, var)
+VariableFeatures(obj) <- names(sort(gene_var, decreasing = TRUE))[1:2000]
+
+# 3) Continue downstream
+obj <- ScaleData(obj, features = VariableFeatures(obj))
+obj <- RunPCA(obj, features = VariableFeatures(obj))
+# update to umap-learn to erase warning, to use R just use uwot
+obj <- RunUMAP(obj, dims = 1:20, umap.method = "umap-learn", metric = "correlation") 
+obj <- FindNeighbors(obj, dims = 1:20)
+obj <- FindClusters(obj)
+
+# let's find genes detected by cell with log-exp > 0
+data_mat <- GetAssayData(obj, layer = "data")
+
+obj$genes_detected <- Matrix::colSums(data_mat > 0)
+quantile(obj$genes_detected, probs = c(0.01,0.05,0.1,0.5,0.9,0.95,0.99), na.rm = TRUE)
+
+# proxy for library size
+obj$sum_logexpr <- Matrix::colSums(data_mat)
+quantile(obj$sum_logexpr, probs = c(0.01,0.05,0.1,0.5,0.9,0.95,0.99), na.rm = TRUE)
+
+# proxy for mitochondrial signal, this is GEO so this is just practice 
+mt_genes <- grep("^MT-", rownames(obj[["RNA"]]), value = TRUE)
+length(mt_genes)  # should be > 0; if 0, your naming isn't MT-
+
+obj$mt_score <- Matrix::colMeans(data_mat[mt_genes, , drop = FALSE])
+quantile(obj$mt_score, probs = c(0.5,0.9,0.95,0.99), na.rm = TRUE)
+```
+
+
+# Proxy for standard QC
+```{r}
+data_mat <- GetAssayData(obj, assay = "RNA", layer = "data")
+
+obj$genes_detected <- Matrix::colSums(data_mat > 0)
+obj$sum_logexpr    <- Matrix::colSums(data_mat)
+
+mt_genes <- grep("^MT-", rownames(obj[["RNA"]]), value = TRUE)
+
+plot_feats <- c("genes_detected", "sum_logexpr")
+
+if (length(mt_genes) > 0) {
+  obj$mt_score <- Matrix::colMeans(data_mat[mt_genes, , drop = FALSE])
+  plot_feats <- c(plot_feats, "mt_score")
+} else {
+  message("No MT- genes found; skipping mt_score plot.")
+}
+
+VlnPlot(obj, features = plot_feats, ncol = length(plot_feats))
+
+# note, geo data matrix does not have mt 
+# higher genes_detected means higher transcriptomic complexity
+```
+# example of how to test if a cluster (3) is biologically meaningful: cluster and plot UMAP and see if 3 is an edge island or randomly scattered fprminmg a diffuse cloud
+```{r}
+FeaturePlot(obj, features = c("genes_detected"))
+DimPlot(obj, label = TRUE)
+```
+
+# follow : https://satijalab.org/seurat/articles/pbmc3k_tutorial
+```{r}
+# problem is this is a GEO already log-normalized dataset
+DefaultAssay(obj) <- "RNA"
+
+# ------------------------------------------------------------
+# 1) Mitochondrial percentage (practice only for this dataset)
+# ------------------------------------------------------------
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+
+# ------------------------------------------------------------
+# 2) Find Highly Variable Genes (Seurat way)
+# ------------------------------------------------------------
+obj <- FindVariableFeatures(
+  obj,
+  selection.method = "dispersion",
+  nfeatures = 2000
+)
+
+# Optional: visualize HVGs
+top10 <- head(VariableFeatures(obj), 10)
+plot1 <- VariableFeaturePlot(obj)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+
+# ------------------------------------------------------------
+# 3) Scale on HVGs only
+# ------------------------------------------------------------
+obj <- ScaleData(
+  obj,
+  features = VariableFeatures(obj)
+)
+
+# ------------------------------------------------------------
+# 4) PCA
+# ------------------------------------------------------------
+obj <- RunPCA(
+  obj,
+  features = VariableFeatures(obj)
+)
+
+ElbowPlot(obj, ndims = 50)
+
+# ------------------------------------------------------------
+# 5) Neighbors + Clusters
+# ------------------------------------------------------------
+obj <- FindNeighbors(obj, dims = 1:20)
+obj <- FindClusters(obj, resolution = 0.4)
+
+# ------------------------------------------------------------
+# 6) UMAP (use uwot unless you really want Python)
+# ------------------------------------------------------------
+obj <- RunUMAP(
+  obj,
+  dims = 1:20,
+  umap.method = "uwot",      # faster, no python warnings
+  metric = "cosine"
+)
+
+DimPlot(obj, reduction = "umap", label = TRUE)
+```
+
+```{r}
+VizDimLoadings(obj, dims = 1:2, reduction = "pca")
+
+```
+```{r}
+DimPlot(obj, reduction = "pca") + NoLegend()
+```
+```{r}
+DimHeatmap(obj, dims = 1, cells = 500, balanced = TRUE)
+
+```
+# determine dimensionality of data
+```{r}
+ElbowPlot(obj)
+```
+```{r}
+obj <- RunTSNE(obj, dims = 1:20)
+DimPlot(obj, reduction = "tsne", label = TRUE)
+```
+
+```{r}
+#let's find markers
+markers <- FindAllMarkers(
+  obj,
+  only.pos = TRUE,        # keep it simple at first
+  min.pct = 0.25,         # gene expressed in >=25% of cells in cluster
+  logfc.threshold = 0.25  # minimum effect size
+)
+
+# Top markers per cluster
+library(dplyr)
+top_markers <- markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 10)
+
+top_markers
+```
+
+```{r}
+genes_to_plot <- c("NEUROD6", "RBFOX1", "GRIK3", "PRDM8", "NPTX1")
+FeaturePlot(obj, features = genes_to_plot, reduction = "umap", ncol = 3)
+FeaturePlot(obj, features = genes_to_plot, reduction = "tsne", ncol = 3)
+VlnPlot(obj, features = genes_to_plot, ncol = 3)
+```
+```{r}
+# Investigate cluster 3 specifically
+m3 <- FindMarkers(obj, ident.1 = 3, only.pos = TRUE)
+head(m3, 15)
+```
+
+```{r}
+obj <- CellCycleScoring(
+  obj,
+  s.features = cc.genes$s.genes,
+  g2m.features = cc.genes$g2m.genes
+)
+
+VlnPlot(obj, features = c("S.Score", "G2M.Score"))
+```
+# let's make a sample panel to match clusters to most likely cell types 
+```{r}
+panel <- c("SOX2","PAX6","VIM","NES","HES1","FABP7","SLC1A3",
+           "EOMES","DCX","TUBB3",
+           "NEUROD6","SATB2","TBR1","SLC17A7",
+           "GAD1","GAD2","DLX1","DLX2",
+           "GFAP","AQP4","ALDH1L1","S100B",
+           "OLIG1","OLIG2","PDGFRA","MBP","PLP1",
+           "MKI67","TOP2A","CDK1")
+
+DotPlot(obj, features = panel) + RotatedAxis()
+```
+# let's get a reference
+```{r}
+ref <- HumanPrimaryCellAtlasData()
+```
+
+
+# convert Seurat to SingleCellExperiment to use singleR
+```{r}
+sce <- as.SingleCellExperiment(obj)
+
+pred_clust <- SingleR(
+  test = sce,
+  ref = ref,
+  labels = ref$label.main,
+  clusters = Idents(obj)   # <- key fix
+)
+
+pred_clust
+```
+
+```{r}
+# 1) Create mapping: cluster -> label (prefer pruned.labels if available)
+cluster_to_label <- pred_clust$pruned.labels
+cluster_to_label[is.na(cluster_to_label)] <- pred_clust$labels[is.na(cluster_to_label)]
+names(cluster_to_label) <- rownames(pred_clust)  # "0"..."6"
+
+# 2) Map to each cell using its cluster id
+cell_clusters <- as.character(Idents(obj))        # length = #cells
+cell_labels <- cluster_to_label[cell_clusters]
+names(cell_labels) <- colnames(obj)              # MUST be cell names
+
+# 3) Store in Seurat metadata
+obj <- AddMetaData(obj, metadata = cell_labels, col.name = "SingleR_label")
+
+Idents(obj) <- "seurat_clusters"   # or whatever your clustering column is
+table(Idents(obj))
+
+table(obj$SingleR_label)
+table(obj$SingleR_label, obj$seurat_clusters)
+```
+
+```{r}
+
+```
+
+
+# Assign the labels back to Seurat
+```{r}
+FeaturePlot(obj, features = c("NEUROD6","RBFOX1","MKI67","SOX2","GFAP"), ncol = 3)
+DimPlot(obj, group.by = "SingleR_label", label = TRUE)
+```
+# snippet
+```{r}
+table(obj$SingleR_label, obj$seurat_clusters)
+```
+
