@@ -278,7 +278,8 @@ if (any(!is.na(obj$mt_score))) {
 # Proxy for standard QC
 ```{r}
 
-
+# proxy
+plot_feats <- c("genes_detected", "sum_logexpr")
 VlnPlot(obj, features = plot_feats, ncol = length(plot_feats))
 
 # note, geo data matrix does not have mt 
@@ -423,10 +424,6 @@ genes_to_plot <- markers %>%
   slice_head(n = 2) %>%
   pull(gene) %>%
   unique()
-
-top_markers %>%
-  dplyr::select(cluster, gene, avg_log2FC) %>%
-  dplyr::arrange(cluster)
 
 # use for feature plot
 FeaturePlot(obj, features = genes_to_plot[1:6], reduction = "umap", order = TRUE)
@@ -617,4 +614,5 @@ ridgeplot(
 ) +
   theme_bw(base_size = 12)
 ```
+
 
